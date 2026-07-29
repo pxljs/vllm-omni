@@ -2380,11 +2380,13 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
     class _Plane:
         def __init__(self) -> None:
             self.calls = 0
+            self.retried = asyncio.Event()
 
         async def reap_expired(self) -> int:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("transient cleanup failure")
+            self.retried.set()
             return 0
 
     orchestrator = object.__new__(Orchestrator)
@@ -2393,9 +2395,11 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
     orchestrator._shutdown_event = asyncio.Event()
 
     task = asyncio.create_task(orchestrator._duplex_reaper_loop())
-    await asyncio.sleep(0.035)
-    orchestrator._shutdown_event.set()
-    await task
+    try:
+        await asyncio.wait_for(orchestrator.duplex_control_plane.retried.wait(), timeout=1.0)
+    finally:
+        orchestrator._shutdown_event.set()
+        await task
 
     assert orchestrator.duplex_control_plane.calls >= 2
 
