@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -13,7 +14,12 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
-from vllm_omni.engine.messages import CacheResetReplicaResult, ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import (
+    CacheResetReplicaResult,
+    ErrorMessage,
+    OutputMessage,
+    SchedulerControlReplicaResult,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
@@ -494,6 +500,75 @@ async def test_reset_mm_cache_clears_renderer_and_rejects_diffusion_only():
     with pytest.raises(NotImplementedError, match="not applicable"):
         await omni.reset_mm_cache()
     renderer.clear_mm_cache_async.assert_awaited_once_with()
+
+
+def _scheduler_result(*, status: str = "success", result: bool | None = None, error: str | None = None):
+    return SchedulerControlReplicaResult(
+        stage_id=0,
+        replica_id=0,
+        stage_type="llm",
+        status=status,
+        result=result,
+        error=error,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_and_status_control_ar_schedulers():
+    omni = object.__new__(AsyncOmni)
+    omni._pause_cond = asyncio.Condition()
+    omni._paused = False
+    omni.engine = SimpleNamespace(
+        pause_schedulers_async=AsyncMock(return_value=[_scheduler_result()]),
+        resume_schedulers_async=AsyncMock(return_value=[_scheduler_result()]),
+        are_schedulers_paused_async=AsyncMock(return_value=[_scheduler_result(result=True)]),
+    )
+
+    await omni.pause_generation(mode="wait", clear_cache=False)
+    assert omni._paused is True
+    assert await omni.is_paused() is True
+    await omni.resume_generation()
+    assert omni._paused is False
+    omni.engine.pause_schedulers_async.assert_awaited_once_with(mode="wait", clear_cache=False)
+    omni.engine.resume_schedulers_async.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_pause_failure_rolls_back_schedulers_and_frontend_admission():
+    omni = object.__new__(AsyncOmni)
+    omni._pause_cond = asyncio.Condition()
+    omni._paused = False
+    omni.engine = SimpleNamespace(
+        pause_schedulers_async=AsyncMock(
+            return_value=[_scheduler_result(status="failed", error="replica unavailable")]
+        ),
+        resume_schedulers_async=AsyncMock(return_value=[_scheduler_result()]),
+    )
+
+    with pytest.raises(RuntimeError, match="stage 0 replica 0: replica unavailable"):
+        await omni.pause_generation(clear_cache=False)
+
+    assert omni._paused is False
+    omni.engine.resume_schedulers_async.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_inflight_requests_maps_to_wait_mode():
+    omni = object.__new__(AsyncOmni)
+    omni._pause_cond = asyncio.Condition()
+    omni._paused = False
+    omni.engine = SimpleNamespace(
+        pause_schedulers_async=AsyncMock(return_value=[_scheduler_result()]),
+    )
+
+    with pytest.warns(DeprecationWarning):
+        await omni.pause_generation(
+            mode="abort",
+            wait_for_inflight_requests=True,
+            clear_cache=False,
+        )
+
+    omni.engine.pause_schedulers_async.assert_awaited_once_with(mode="wait", clear_cache=False)
 
 
 def test_get_diffusion_od_config_returns_diffusion_stage_config():

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +28,12 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
-from vllm_omni.engine.messages import CacheResetReplicaResult, ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import (
+    CacheResetReplicaResult,
+    ErrorMessage,
+    OutputMessage,
+    SchedulerControlReplicaResult,
+)
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -1027,36 +1033,65 @@ class AsyncOmni(EngineClient, OmniBase):
         self,
         *,
         mode: PauseMode = "abort",
-        wait_for_inflight_requests: bool = False,
+        wait_for_inflight_requests: bool | None = None,
         clear_cache: bool = True,
     ) -> None:
-        """Pause generation."""
+        """Pause admission and all AR schedulers across the Omni graph."""
+        if mode not in ("abort", "wait", "keep"):
+            raise ValueError(f"Invalid pause mode: {mode}")
+        if wait_for_inflight_requests:
+            warnings.warn(
+                "The `wait_for_inflight_requests` parameter is deprecated; use mode='wait' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            mode = "wait"
+
         async with self._pause_cond:
             if self._paused:
                 return
             self._paused = True
-
-        # TODO: Implement request draining if wait_for_inflight_requests
-
-        if clear_cache:
-            # Clear caches for all stages.
-            await self.reset_prefix_cache(
-                reset_running_requests=not wait_for_inflight_requests,
-                reset_connector=True,
-            )
-            await self.reset_mm_cache()
-            await self.reset_encoder_cache()
+            try:
+                if clear_cache:
+                    renderer = self.renderer
+                    clear_renderer_cache = getattr(renderer, "clear_mm_cache_async", None)
+                    if clear_renderer_cache is not None:
+                        await clear_renderer_cache()
+                results = await self.engine.pause_schedulers_async(
+                    mode=mode,
+                    clear_cache=clear_cache,
+                )
+                self._validate_scheduler_control_results("pause", results)
+                await asyncio.sleep(0.02)
+            except (Exception, asyncio.CancelledError):
+                try:
+                    rollback_results = await self.engine.resume_schedulers_async()
+                    self._validate_scheduler_control_results("pause rollback", rollback_results)
+                except Exception:
+                    logger.exception("[AsyncOmni] Failed to roll back scheduler pause")
+                self._paused = False
+                self._pause_cond.notify_all()
+                raise
 
     async def resume_generation(self) -> None:
-        """Resume generation."""
+        """Resume all AR schedulers before reopening frontend admission."""
         async with self._pause_cond:
+            if not self._paused:
+                return
+            results = await self.engine.resume_schedulers_async()
+            self._validate_scheduler_control_results("resume", results)
             self._paused = False
             self._pause_cond.notify_all()
 
     async def is_paused(self) -> bool:
-        """Check if paused."""
+        """Return whether frontend admission and every AR scheduler are paused."""
         async with self._pause_cond:
-            return self._paused
+            if not self._paused:
+                return False
+            results = await self.engine.are_schedulers_paused_async()
+            self._validate_scheduler_control_results("status", results)
+            applicable = [result for result in results if result.status == "success"]
+            return not applicable or all(result.result is True for result in applicable)
 
     async def start_profile(
         self,
@@ -1122,6 +1157,19 @@ class AsyncOmni(EngineClient, OmniBase):
                 for result in failures
             )
             raise RuntimeError(f"{kind} cache reset failed: {details}")
+
+    @staticmethod
+    def _validate_scheduler_control_results(
+        action: str,
+        results: list[SchedulerControlReplicaResult],
+    ) -> None:
+        failures = [result for result in results if result.status == "failed"]
+        if failures:
+            details = "; ".join(
+                f"stage {result.stage_id} replica {result.replica_id}: {result.error or 'unknown error'}"
+                for result in failures
+            )
+            raise RuntimeError(f"scheduler {action} failed: {details}")
 
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"

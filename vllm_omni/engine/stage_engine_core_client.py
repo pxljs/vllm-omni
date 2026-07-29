@@ -31,7 +31,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
-    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine import EngineCoreOutput, PauseMode
 
     from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -447,6 +447,19 @@ class StageEngineCoreClientBase(StageClientBase):
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
         )
+
+    async def pause_scheduler_async(
+        self,
+        mode: PauseMode = "abort",
+        clear_cache: bool = True,
+    ) -> None:
+        await super().pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+
+    async def resume_scheduler_async(self) -> None:
+        await super().resume_scheduler_async()
+
+    async def is_scheduler_paused_async(self) -> bool:
+        return await super().is_scheduler_paused_async()
 
 
 class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):

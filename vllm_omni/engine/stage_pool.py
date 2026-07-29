@@ -19,7 +19,13 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine.messages import CacheResetKind, CacheResetReplicaResult
+from vllm_omni.engine.messages import (
+    CacheResetKind,
+    CacheResetReplicaResult,
+    SchedulerControlAction,
+    SchedulerControlReplicaResult,
+    SchedulerPauseMode,
+)
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -1263,6 +1269,65 @@ class StagePool:
                 kind,
             )
             return CacheResetReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="failed",
+                error=str(exc),
+            )
+
+    async def scheduler_control(
+        self,
+        replica_id: int,
+        action: SchedulerControlAction,
+        *,
+        mode: SchedulerPauseMode = "abort",
+        clear_cache: bool = True,
+    ) -> SchedulerControlReplicaResult:
+        """Apply one scheduler control operation to one AR replica."""
+        stage_type = self.stage_type
+        if stage_type != "llm":
+            return SchedulerControlReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="not_applicable",
+            )
+
+        client = self.clients[replica_id]
+        if client is None:
+            return SchedulerControlReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="failed",
+                error="replica is not attached",
+            )
+
+        llm_client = cast(StagePoolLLMClient, client)
+        try:
+            result: bool | None = None
+            if action == "pause":
+                await llm_client.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+            elif action == "resume":
+                await llm_client.resume_scheduler_async()
+            else:
+                result = await llm_client.is_scheduler_paused_async()
+            return SchedulerControlReplicaResult(
+                stage_id=self.stage_id,
+                replica_id=replica_id,
+                stage_type=stage_type,
+                status="success",
+                result=result,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[StagePool] scheduler control failed: stage=%s replica=%s action=%s",
+                self.stage_id,
+                replica_id,
+                action,
+            )
+            return SchedulerControlReplicaResult(
                 stage_id=self.stage_id,
                 replica_id=replica_id,
                 stage_type=stage_type,

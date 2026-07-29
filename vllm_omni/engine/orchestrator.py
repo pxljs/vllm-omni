@@ -44,6 +44,9 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
+    SchedulerControlReplicaResult,
+    SchedulerControlRequestMessage,
+    SchedulerControlResultMessage,
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
@@ -583,6 +586,8 @@ class Orchestrator:
                 await self._handle_collective_rpc(msg)
             elif msg_type == "cache_reset":
                 await self._handle_cache_reset(msg)
+            elif msg_type == "scheduler_control":
+                await self._handle_scheduler_control(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
@@ -845,6 +850,67 @@ class Orchestrator:
             CacheResetResultMessage(
                 rpc_id=msg.rpc_id,
                 kind=msg.kind,
+                results=results,
+            )
+        )
+
+    async def _handle_scheduler_control(self, msg: SchedulerControlRequestMessage) -> None:
+        """Coordinate a scheduler transition across the whole Omni graph."""
+        if msg.action == "pause" and msg.mode == "keep":
+            diffusion_results = [
+                SchedulerControlReplicaResult(
+                    stage_id=pool.stage_id,
+                    replica_id=replica_id,
+                    stage_type=pool.stage_type,
+                    status="failed",
+                    error="pause mode 'keep' is not supported for diffusion stages",
+                )
+                for pool in self.stage_pools
+                if pool.stage_type == "diffusion"
+                for replica_id in pool.live_replica_ids()
+            ]
+            if diffusion_results:
+                await self._put_scheduler_control_result(msg, diffusion_results)
+                return
+
+        if msg.action == "pause" and msg.mode == "abort":
+            request_ids = list(self.request_states)
+            for request_id in request_ids:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        error="Request aborted because generation was paused.",
+                        error_type="RequestAborted",
+                        request_id=request_id,
+                    )
+                )
+            await self._cleanup_request_ids(request_ids, abort=True)
+        elif msg.action == "pause" and msg.mode == "wait":
+            while self.request_states:
+                await asyncio.sleep(0.01)
+
+        calls = [
+            pool.scheduler_control(
+                replica_id,
+                msg.action,
+                mode=msg.mode,
+                clear_cache=msg.clear_cache,
+            )
+            for pool in self.stage_pools
+            for replica_id in pool.live_replica_ids()
+        ]
+        results = await asyncio.gather(*calls)
+        await self._put_scheduler_control_result(msg, results)
+
+    async def _put_scheduler_control_result(
+        self,
+        msg: SchedulerControlRequestMessage,
+        results: list[SchedulerControlReplicaResult],
+    ) -> None:
+        results.sort(key=lambda item: (item.stage_id, item.replica_id))
+        await self.rpc_async_queue.put(
+            SchedulerControlResultMessage(
+                rpc_id=msg.rpc_id,
+                action=msg.action,
                 results=results,
             )
         )

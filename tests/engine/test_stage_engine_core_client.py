@@ -48,3 +48,12 @@ async def test_reset_prefix_cache_uses_engine_core_utility():
         reset_running_requests=True,
         reset_connector=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_pause_scheduler_uses_engine_core_utility():
+    client = _make_client()
+    with patch.object(AsyncMPClient, "pause_scheduler_async", new=AsyncMock()) as pause:
+        await client.pause_scheduler_async(mode="wait", clear_cache=True)
+
+    pause.assert_awaited_once_with(mode="wait", clear_cache=True)

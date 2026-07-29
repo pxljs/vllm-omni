@@ -56,6 +56,9 @@ class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
 
 CacheResetKind = Literal["prefix", "mm", "encoder"]
 CacheResetStatus = Literal["success", "not_applicable", "failed"]
+SchedulerControlAction = Literal["pause", "resume", "status"]
+SchedulerControlStatus = Literal["success", "not_applicable", "failed"]
+SchedulerPauseMode = Literal["abort", "wait", "keep"]
 
 
 class CacheResetRequestMessage(EngineQueueMessage, kw_only=True):
@@ -64,6 +67,14 @@ class CacheResetRequestMessage(EngineQueueMessage, kw_only=True):
     kind: CacheResetKind
     reset_running_requests: bool = False
     reset_connector: bool = False
+
+
+class SchedulerControlRequestMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["scheduler_control"] = "scheduler_control"
+    rpc_id: str
+    action: SchedulerControlAction
+    mode: SchedulerPauseMode = "abort"
+    clear_cache: bool = True
 
 
 class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):
@@ -142,3 +153,23 @@ class CacheResetResultMessage(EngineQueueMessage, kw_only=True):
     @property
     def rpc_correlation_key(self) -> tuple[str, str]:
         return ("cache_reset", self.rpc_id)
+
+
+class SchedulerControlReplicaResult(msgspec.Struct, kw_only=True):
+    stage_id: int
+    replica_id: int
+    stage_type: str | None
+    status: SchedulerControlStatus
+    result: bool | None = None
+    error: str | None = None
+
+
+class SchedulerControlResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["scheduler_control_result"] = "scheduler_control_result"
+    rpc_id: str
+    action: SchedulerControlAction
+    results: list[SchedulerControlReplicaResult]
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("scheduler_control", self.rpc_id)

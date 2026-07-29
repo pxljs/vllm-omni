@@ -59,6 +59,11 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    SchedulerControlAction,
+    SchedulerControlReplicaResult,
+    SchedulerControlRequestMessage,
+    SchedulerControlResultMessage,
+    SchedulerPauseMode,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -1827,6 +1832,64 @@ class AsyncOmniEngine:
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
         )
+
+    def _scheduler_control(
+        self,
+        action: SchedulerControlAction,
+        *,
+        mode: SchedulerPauseMode = "abort",
+        clear_cache: bool = True,
+    ) -> list[SchedulerControlReplicaResult]:
+        rpc_id = uuid.uuid4().hex
+        msg = SchedulerControlRequestMessage(
+            rpc_id=rpc_id,
+            action=action,
+            mode=mode,
+            clear_cache=clear_cache,
+        )
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+        result_msg = transport.execute(
+            ("scheduler_control", rpc_id),
+            msg,
+            timeout=None,
+            timeout_message=f"scheduler {action} timed out",
+            block_on_submit=True,
+        )
+        if not isinstance(result_msg, SchedulerControlResultMessage):
+            raise RuntimeError(f"unexpected scheduler control result type: {type(result_msg).__name__}")
+        return list(result_msg.results)
+
+    async def _scheduler_control_async(
+        self,
+        action: SchedulerControlAction,
+        *,
+        mode: SchedulerPauseMode = "abort",
+        clear_cache: bool = True,
+    ) -> list[SchedulerControlReplicaResult]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._scheduler_control(
+                action,
+                mode=mode,
+                clear_cache=clear_cache,
+            ),
+        )
+
+    async def pause_schedulers_async(
+        self,
+        mode: SchedulerPauseMode = "abort",
+        clear_cache: bool = True,
+    ) -> list[SchedulerControlReplicaResult]:
+        return await self._scheduler_control_async("pause", mode=mode, clear_cache=clear_cache)
+
+    async def resume_schedulers_async(self) -> list[SchedulerControlReplicaResult]:
+        return await self._scheduler_control_async("resume")
+
+    async def are_schedulers_paused_async(self) -> list[SchedulerControlReplicaResult]:
+        return await self._scheduler_control_async("status")
 
     def is_alive(self) -> bool:
         """Whether the orchestrator thread is alive."""

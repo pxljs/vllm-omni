@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, PauseMode
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniTokensPrompt
     from vllm_omni.outputs import OmniRequestOutput
@@ -81,6 +81,16 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         reset_running_requests: bool = False,
         reset_connector: bool = False,
     ) -> bool: ...
+
+    async def pause_scheduler_async(
+        self,
+        mode: PauseMode = "abort",
+        clear_cache: bool = True,
+    ) -> None: ...
+
+    async def resume_scheduler_async(self) -> None: ...
+
+    async def is_scheduler_paused_async(self) -> bool: ...
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None: ...
 

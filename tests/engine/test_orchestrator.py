@@ -25,6 +25,8 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     ErrorMessage,
     OutputMessage,
+    SchedulerControlRequestMessage,
+    SchedulerControlResultMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
@@ -258,6 +260,33 @@ class FakeCacheResetStageClient(FakeStageClient):
     async def reset_encoder_cache_async(self) -> None:
         self.cache_reset_calls.append(("encoder", ()))
         self._maybe_raise()
+
+
+class FakeSchedulerControlStageClient(FakeStageClient):
+    def __init__(self, *args, paused: bool = False, control_error: Exception | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.paused = paused
+        self.control_error = control_error
+        self.scheduler_control_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def _maybe_raise_control_error(self) -> None:
+        if self.control_error is not None:
+            raise self.control_error
+
+    async def pause_scheduler_async(self, mode: str = "abort", clear_cache: bool = True) -> None:
+        self.scheduler_control_calls.append(("pause", (mode, clear_cache)))
+        self._maybe_raise_control_error()
+        self.paused = True
+
+    async def resume_scheduler_async(self) -> None:
+        self.scheduler_control_calls.append(("resume", ()))
+        self._maybe_raise_control_error()
+        self.paused = False
+
+    async def is_scheduler_paused_async(self) -> bool:
+        self.scheduler_control_calls.append(("status", ()))
+        self._maybe_raise_control_error()
+        return self.paused
 
 
 class FakeOutputProcessor:
@@ -2125,6 +2154,110 @@ async def test_cache_reset_reports_replica_failure(orchestrator_factory) -> None
         assert msg.results[0].stage_id == 0
         assert msg.results[0].replica_id == 0
         assert msg.results[0].error == "reset failed"
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_pause_waits_for_omni_request_graph_to_drain(orchestrator_factory) -> None:
+    stage0 = FakeSchedulerControlStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+    orchestrator_fixture.orchestrator.request_states["active"] = SimpleNamespace()
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SchedulerControlRequestMessage(
+                rpc_id="scheduler-wait",
+                action="pause",
+                mode="wait",
+                clear_cache=True,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert stage0.scheduler_control_calls == []
+
+        orchestrator_fixture.orchestrator.request_states.pop("active")
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert isinstance(msg, SchedulerControlResultMessage)
+        assert msg.results[0].status == "success"
+        assert stage0.scheduler_control_calls == [("pause", ("wait", True))]
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_keep_rejects_diffusion_without_pausing_ar(orchestrator_factory) -> None:
+    stage0 = FakeSchedulerControlStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            None,
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SchedulerControlRequestMessage(
+                rpc_id="scheduler-keep",
+                action="pause",
+                mode="keep",
+                clear_cache=False,
+            )
+        )
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert isinstance(msg, SchedulerControlResultMessage)
+        assert [(r.stage_id, r.replica_id, r.status) for r in msg.results] == [(1, 0, "failed")]
+        assert "not supported for diffusion" in (msg.results[0].error or "")
+        assert stage0.scheduler_control_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_abort_notifies_and_cleans_active_requests(orchestrator_factory) -> None:
+    stage0 = FakeSchedulerControlStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    stage_pools[0]._request_bindings["active"] = 0
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+    orchestrator_fixture.orchestrator.request_states["active"] = SimpleNamespace(
+        running_counter_registered=False,
+    )
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SchedulerControlRequestMessage(
+                rpc_id="scheduler-abort",
+                action="pause",
+                mode="abort",
+                clear_cache=True,
+            )
+        )
+        msg = await _get_rpc_message(orchestrator_fixture)
+        await _wait_for(lambda: not orchestrator_fixture.output_sync_q.empty())
+        error = orchestrator_fixture.output_sync_q.get_nowait()
+
+        assert isinstance(msg, SchedulerControlResultMessage)
+        assert isinstance(error, ErrorMessage)
+        assert error.request_id == "active"
+        assert error.error_type == "RequestAborted"
+        assert "active" not in orchestrator_fixture.orchestrator.request_states
+        assert stage0.abort_calls == [["active"]]
+        assert stage0.scheduler_control_calls == [("pause", ("abort", True))]
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
