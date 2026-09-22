@@ -50,10 +50,15 @@ class RotaryPositionalEmbeddings(nn.Module):
         self.register_buffer("cache", cache, persistent=False)
 
     def prepare(self, needed_seq_len: int, device: torch.device) -> None:
-        """Ensure the RoPE cache is ready without reading a device tensor."""
+        """Ensure the RoPE cache is ready in FP32 without reading a device tensor."""
         if needed_seq_len < 0:
             raise ValueError(f"needed_seq_len must be non-negative, got {needed_seq_len}")
-        if self.theta.device != device:
+        if (
+            self.theta.device != device
+            or self.theta.dtype != torch.float32
+            or self.cache.dtype != torch.float32
+        ):
+            # Recompute from base; upcasting rounded buffers cannot restore precision.
             self.rope_init(device=device)
         if needed_seq_len > self.cache.size(0):
             self.build_rope_cache(max(needed_seq_len, self.cache.size(0) * 2))
