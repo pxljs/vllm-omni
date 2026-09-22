@@ -5,7 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
+            "cuda": ["H100", "B200"],
             "npu": "A3"
           },
           "num_cards": 2
@@ -121,7 +121,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 2
         }
@@ -276,7 +276,32 @@
             ]
           }
         }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen3_tts_voicedesign",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 2
+        }
       },
+      "full_model",
+      "tts"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      "stage_overrides": {
+        "1": {
+          "devices": "1"
+        }
+      }
+    },
+    "benchmark_params": [
       {
         "task": "voice_design",
         "eval_phase": "latency",
@@ -391,7 +416,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 1
         }
@@ -424,10 +449,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              82.1886
+              82.6344
             ],
             "median_audio_rtf": [
-              0.1241
+              0.1277
             ]
           }
         }
@@ -453,13 +478,13 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              160.9168
+              170.3737
             ],
             "median_audio_rtf": [
-              0.1907
+              0.2076
             ],
             "audio_throughput": [
-              39.2332
+              37.0834
             ]
           }
         }
@@ -485,13 +510,13 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              100.1265
+              101.0293
             ],
             "median_audio_rtf": [
-              0.1437
+              0.1498
             ],
             "audio_throughput": [
-              11.7605
+              10.1186
             ]
           }
         }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -15,7 +15,12 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
     DiffusionExecutionMode,
@@ -25,6 +30,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     NewRequestData,
+    _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
@@ -74,6 +80,34 @@ class MockScheduler:
 
     def num_running_requests(self) -> int:
         return 0
+
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> _AdmissionWaitDecision:
+        del dp_concurrent
+        return _AdmissionWaitDecision(
+            should_wait=True,
+            deadline=now + 0.5,
+            stable_window_s=0.05,
+            max_batch=self.max_num_running_reqs,
+        )
+
+    def should_end_admission_wait(
+        self,
+        decision: _AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        waiting = self.num_waiting_requests()
+        return (
+            waiting >= decision.max_batch
+            or (waiting > 0 and now - stable_since >= decision.stable_window_s)
+            or (decision.deadline is not None and now >= decision.deadline)
+        )
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._waiting_queue:
@@ -154,6 +188,28 @@ def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionScheduler
     )
 
 
+@pytest.mark.cpu
+def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
+    sched_output = _make_request_mode_sched_output("tracked", "untracked")
+    sched_output.scheduled_new_reqs[0].req.sampling_params.emit_request_lifecycle = True
+    engine = object.__new__(DiffusionEngine)
+    emitted = []
+    engine._put_output = lambda request_id, output: emitted.append((request_id, output))
+
+    engine._emit_request_started_outputs(sched_output)
+
+    assert len(emitted) == 1
+    request_id, output = emitted[0]
+    assert request_id == "tracked"
+    assert output.request_started is True
+    assert output.finished is False
+    [formatted] = engine.postprocess_output(sched_output.scheduled_new_reqs[0].req, output)
+    assert formatted.custom_output == {
+        DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED,
+    }
+    assert formatted.finished is False
+
+
 class TestRequestBatchCapability:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -167,6 +223,59 @@ class TestRequestBatchCapability:
         )
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
+
+    def test_engine_rejects_multi_seq_diffusers_using_adapter_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args=None,
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(
+            side_effect=lambda model_class_name: (
+                _SingleRequestPipeline if model_class_name == "DiffusersAdapterPipeline" else _BatchCapablePipeline
+            )
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        with pytest.raises(ValueError, match="max_num_seqs=1"):
+            engine._resolve_execution_mode(od_config)
+
+        registry_load.assert_called_once_with("DiffusersAdapterPipeline")
+
+    def test_engine_prefers_batch_capable_custom_pipeline_over_diffusers_adapter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args={"pipeline_class": _BatchCapablePipeline},
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(return_value=_SingleRequestPipeline)
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+        registry_load.assert_not_called()
 
     def test_supports_request_batch_uses_custom_pipeline_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
         od_config = SimpleNamespace(
@@ -518,6 +627,34 @@ class TestDiffusionCompileConfig:
             ),
             ({"enable_cpu_offload": True}, "CPU offload"),
             ({"enable_layerwise_offload": True}, "layerwise offload"),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "module",
+                        "components": ["dit"],
+                    }
+                },
+                "CPU offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                    }
+                },
+                "layerwise offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                        "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                    }
+                },
+                "distributed layerwise offload",
+            ),
         ],
     )
     def test_full_compile_rejects_incompatible_features(self, kwargs, feature) -> None:
@@ -528,6 +665,34 @@ class TestDiffusionCompileConfig:
                 **kwargs,
             )
 
+    def test_raw_parallel_mapping_is_normalized_before_allgather_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache decisions"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": 2},
+                cache_backend="tea_cache",
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["dit"],
+                    "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                },
+            )
+
+    def test_auto_dp_is_resolved_before_encoder_prompt_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache hits"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": None},
+                enable_prompt_embed_cache=True,
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["text_encoder"],
+                    "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+                },
+            )
+
 
 class TestRequestBatchAdmission:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -535,6 +700,11 @@ class TestRequestBatchAdmission:
     def test_config_rejects_negative_request_batch_max_wait_ms(self) -> None:
         with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
             OmniDiffusionConfig(model="test", request_batch_max_wait_ms=-1.0)
+
+    @pytest.mark.parametrize("bad_wait", [float("nan"), float("inf"), float("-inf")])
+    def test_config_rejects_nonfinite_request_batch_max_wait_ms(self, bad_wait: float) -> None:
+        with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
+            OmniDiffusionConfig(model="test", request_batch_max_wait_ms=bad_wait)
 
     def test_config_normalizes_request_batch_max_wait_ms_to_float(self) -> None:
         config = OmniDiffusionConfig(model="test", request_batch_max_wait_ms=5)
@@ -603,7 +773,7 @@ class TestRequestBatchAdmission:
 
         start = time.monotonic()
         with engine._cv:
-            engine._wait_for_request_batch_admission_locked()
+            engine._wait_for_admission_if_needed_locked()
         waited_s = time.monotonic() - start
 
         # Stable-window exit (~50ms), not the full 1000ms deadline.

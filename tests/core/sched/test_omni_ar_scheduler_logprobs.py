@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ _MIXIN_UPDATE_HELPERS = (
     "_attach_finished_request_sets",
     "_attach_scheduler_stats",
     "_capture_omni_connector_output",
+    "_maybe_decode_pooling_output",
 )
 
 
@@ -92,6 +96,10 @@ class _Request:
         self.num_computed_tokens = 0
         self.num_in_flight_tokens = 0
         self.num_output_placeholders = 0
+        self.output_token_ids: list[int] = []
+        # vLLM 0.27 (a0c092ee72): Request gained num_stale_output_tokens to
+        # track in-flight outputs discarded at preemption/streaming-stop.
+        self.num_stale_output_tokens = 0
         self.has_encoder_inputs = False
         self.pooling_params = None
         self.resumable = True
@@ -135,15 +143,27 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         pending_stop_after_extraction=set(),
         waiting_for_transfer_free=set(),
         _new_prompt_len_snapshot={},
+        _pooling_output_decoder=None,
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
         recompute_kv_load_failures=False,
+        _native_data_plane=False,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                use_v2_model_runner=False,
+                async_chunk=False,
+                final_output=True,
+            )
+        ),
     )
     for name in _MIXIN_UPDATE_HELPERS:
         setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
     scheduler._cleanup_kv_tracking = MethodType(OmniARScheduler._cleanup_kv_tracking, scheduler)
+    scheduler._emit_streaming_context_overflow_outputs = MethodType(
+        OmniARScheduler._emit_streaming_context_overflow_outputs, scheduler
+    )
     scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
     scheduler.make_stats = lambda *args, **kwargs: None
     return scheduler
@@ -159,10 +179,15 @@ def _bind_request_lifecycle(
         scheduler.requests.pop(request.request_id, None)
         scheduler.finished_req_ids.add(request.request_id)
         scheduler.finished_req_ids_dict[request.client_index].add(request.request_id)
-        # vLLM 0.26 contract: (kv_xfer_params, ec_xfer_params)
+        # Current vLLM contract: (kv_xfer_params, ec_xfer_params)
         return None, None
 
-    scheduler._update_request_with_output = update_request
+    def update_with_history(request, token_ids):
+        accepted, stopped = update_request(request, token_ids)
+        request.output_token_ids.extend(accepted)
+        return accepted, stopped
+
+    scheduler._update_request_with_output = update_with_history
     scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
     scheduler._handle_stopped_request = handle_stopped or (lambda _request: True)
     scheduler._free_request = free_request
@@ -211,6 +236,7 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     (output,) = outputs[0].outputs
 
     assert output.new_token_ids == [7]
+    assert output.num_generation_tokens == 1
     assert output.finish_reason is FinishReason.STOP
     token_rows = np.asarray(output.new_logprobs.logprob_token_ids)
     value_rows = np.asarray(output.new_logprobs.logprobs)
@@ -264,3 +290,72 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     assert output_by_id["bad"].new_token_ids == []
     assert output_by_id["good"].new_token_ids == [8]
     np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+
+
+def _pooling_model_runner_output(pooler_tensor) -> SimpleNamespace:
+    return SimpleNamespace(
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[pooler_tensor],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req": 0},
+        routed_experts=None,
+    )
+
+
+def _make_pooling_stub(decoder) -> tuple[_Request, SimpleNamespace]:
+    request = _Request("req")
+    request.sampling_params = SimpleNamespace(num_logprobs=None)
+    request.pooling_params = SimpleNamespace()
+    scheduler = _make_scheduler_stub([request])
+    scheduler._pooling_output_decoder = decoder
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=None))
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    return request, scheduler
+
+
+def test_pooling_decode_success_emits_decoded_payload() -> None:
+    import torch
+
+    decoded = torch.tensor([[1, 2]], dtype=torch.int32)
+    request, scheduler = _make_pooling_stub(lambda logits, req, hf: decoded)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    outputs = OmniARScheduler.update_from_output(
+        scheduler, scheduler_output, _pooling_model_runner_output(torch.zeros(2, 4))
+    )
+    (output,) = outputs[0].outputs
+
+    assert output.finish_reason is FinishReason.STOP
+    assert output.pooling_output is decoded
+
+
+def test_pooling_decode_failure_finishes_request_with_error() -> None:
+    import torch
+
+    def raising_decoder(logits, req, hf):
+        raise ValueError("boom")
+
+    request, scheduler = _make_pooling_stub(raising_decoder)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    outputs = OmniARScheduler.update_from_output(
+        scheduler, scheduler_output, _pooling_model_runner_output(torch.zeros(2, 4))
+    )
+    (output,) = outputs[0].outputs
+
+    # Decoder failure is a request error (500), not an empty success.
+    assert output.finish_reason is FinishReason.ERROR
+    assert output.pooling_output is None
+    assert "pooling output decode failed" in str(request.stop_reason)
